@@ -1,0 +1,687 @@
+#!/usr/bin/env python
+import optparse
+import os
+import platform
+import sys
+import codecs
+import datetime
+from dateutil.parser import parse
+from dateutil.relativedelta import *
+import calendar
+from decimal import *
+import locale
+import csv
+import pprint
+import threading
+import logging
+import sqlite3
+import re
+import dateutil.tz
+import dateutil
+import pytz
+utc=pytz.UTC
+
+newFormat = True
+
+edt = dateutil.tz.gettz('EDT')
+
+importtimezone = -4
+
+logging.basicConfig(filename='error.log',level=logging.DEBUG)
+
+locale.setlocale(locale.LC_ALL, '')
+
+if locale.getlocale()[0]==None:
+	locale.setlocale(locale.LC_ALL, 'en_US')
+
+
+def isReturnFile(myfile):
+	if os.path.abspath(os.path.expanduser(myfile.strip())) != False:
+		return os.path.abspath(os.path.expanduser(myfile.strip()))
+	else:
+		print 'You can\'t save to that location'
+		sys.exit()
+		
+		
+def isInt(num):
+	try:
+		return int(round(float(num)))
+	except ValueError:
+		return None
+
+def CreateTables(conn):
+	c = conn.cursor()
+	c.execute("CREATE TABLE if not exists expression(rule TEXT, win INTEGER, strong INTEGER)")
+	c.execute("CREATE TABLE if not exists games(home_team TEXT, away_team TEXT, `when` DATETIME, home_win INTEGER, game_id INTEGER)")
+	c.execute("CREATE TABLE if not exists team(team_key TEXT, name TEXT)")
+	c.execute("CREATE TABLE if not exists sports(word TEXT)")
+	c.execute("CREATE TABLE if not exists expert(word TEXT)")
+	c.execute("CREATE INDEX if not exists game_find_one ON games(home_team, `when`, home_win, `when`)")
+	c.execute("CREATE INDEX if not exists game_find_two ON games(home_team, away_team, `when`, home_win, `when`)")
+	conn.commit()
+	c.close()
+	
+def CreateCleanTables(conn):
+	c = conn.cursor()
+	c.execute("CREATE TABLE if not exists users(twitterid INTEGER, twitterhandle TEXT, name TEXT, location TEXT, verified BOOLEAN, following INTEGER, followers INTEGER, description TEXT, created_at DATETIME, status_count INTEGER, listed_count INTEGER, favorites_count INTEGER, expert INTEGER, sports INTEGER, UNIQUE(twitterid) ON CONFLICT REPLACE)")
+	c.execute("CREATE TABLE if not exists tweet(userid INTEGER, created_at DATETIME, `text` TEXT, retweet BOOLEAN, retweet_count INTEGER, twitterid INTEGER, place TEXT, inconversation BOOLEAN, followers INTEGER)")
+	c.execute("CREATE TABLE if not exists found_prediction(twitterid INTEGER, correct INTEGER, strong INTEGER, gametime DATETIME, game_id INTEGER)")
+	c.execute("CREATE INDEX if not exists twitterid_tweet ON tweet(twitterid)")
+	c.execute("CREATE INDEX if not exists twitterid_prediction ON found_prediction(twitterid)")
+	c.execute("CREATE INDEX if not exists userid_tweet ON tweet(userid)")
+	c.execute("CREATE INDEX if not exists gameid_prediction ON found_prediction(game_id)")
+	conn.commit()
+	c.close()
+
+def ResetCleanTables(conn):
+	c = conn.cursor()
+	c.execute("DROP TABLE if exists found_prediction")
+	conn.commit()
+	c.close()
+	CreateCleanTables(conn)
+	c = conn.cursor()
+	c.execute("CREATE INDEX if not exists gameid_prediction ON found_prediction(game_id)")
+	conn.commit()
+	c.close()
+
+def PrintCountTweets(conn):
+	c = conn.cursor()
+	c.execute("SELECT COUNT(*) AS c FROM tweet")
+	for row in c:
+		print str(row[0])
+	c.close()
+	
+def PrintCountUser(conn):
+	c = conn.cursor()
+	c.execute("SELECT COUNT(*) AS c FROM users")
+	for row in c:
+		print str(row[0])
+	c.close()
+
+def PrintCountPrediction(conn):
+	c = conn.cursor()
+	c.execute("SELECT COUNT(*) AS c FROM prediction")
+	for row in c:
+		print str(row[0])
+	c.close()
+
+
+def CreateRow(connection, hometeam, awayteam, when, win, game_id):
+	c = connection.cursor()
+	mylist = [hometeam,awayteam,when,win,game_id]
+	c.execute("INSERT INTO games(home_team,away_team,`when`,home_win,game_id) VALUES(?,?,?,?,?)",mylist)
+	connection.commit()
+	c.close() 
+
+
+def AddTeamName(connection,teamkey,name):
+	c = connection.cursor()
+	mylist = [teamkey,name]
+	c.execute("INSERT INTO team(team_key,name) VALUES(?,?)",mylist)
+	connection.commit()
+	c.close()
+	
+def AddExpRow(connection, expression, win, confident):
+	c = connection.cursor()
+	mylist = [expression,win,confident]
+	c.execute("INSERT INTO expression(rule,win,strong) VALUES(?,?,?)",mylist)
+	connection.commit()
+	c.close()
+	
+def AddSportsRow(connection, word):
+	c = connection.cursor()
+	mylist = [word,]
+	c.execute("INSERT INTO sports(word) VALUES(?)",mylist)
+	connection.commit()
+	c.close()
+	
+def AddExpertRow(connection, word):
+	c = connection.cursor()
+	mylist = [word,]
+	c.execute("INSERT INTO expert(word) VALUES(?)",mylist)
+	connection.commit()
+	c.close()
+
+def LoadGameData(slcon,filename):
+	print "Loading CSV (Games) data"
+	if os.path.isfile(os.path.abspath(os.path.expanduser(filename))) != False:
+		reader = csv.DictReader(open(os.path.abspath(os.path.expanduser(filename)), 'rU'))
+		for row in reader:
+			hometeam = ''
+			awayteam = ''
+			when = None
+			win = None
+			game_id = None
+			for name in row.keys():
+				if name.lower() == 'home' or name.lower() == 'home team' or name.lower() == 'hometeam':
+					hometeam = str(row.get(name,'')).strip()
+				elif name.lower() == 'away' or name.lower() == 'away team' or name.lower() == 'awayteam':
+					awayteam = str(row.get(name,'')).strip()
+				elif name.lower() == 'when' or name.lower() == 'datetime' or name.lower() == 'date time':
+					when = utc.localize(getDate(str(row.get(name,'')).strip()))
+				elif name.lower() == 'win' or name.lower() == 'home team win' or name.lower() == 'hometeamwin':
+					if isInt(str(row.get(name,''))) != None: 
+						win = isInt(str(row.get(name,'')))
+				elif name.lower() == 'game_id' or name.lower() == 'id':
+					if isInt(str(row.get(name,''))) != None: 
+						game_id = isInt(str(row.get(name,'')))		
+				
+					
+			if len(str(hometeam))>0 and len(str(awayteam))>0 and when != None and win != None and game_id != None:
+				CreateRow(slcon, hometeam, awayteam, when, win, game_id)
+				if win == 1:
+					CreateRow(slcon, awayteam, hometeam, when, 0, game_id)
+				else:
+					CreateRow(slcon, awayteam, hometeam, when, 1, game_id)
+	else:
+		print "Can't find data to load " + str(filename)
+	
+
+
+def LoadTeamData(slcon,filename):
+	print "Loading CSV (Team) data"
+	if os.path.isfile(os.path.abspath(os.path.expanduser(filename))) != False:
+		reader = csv.reader(open(os.path.abspath(os.path.expanduser(filename)), 'rU'))
+		for row in reader:
+			colnumber = 0
+			teamname = ""
+			for col in row:
+				if colnumber == 0:
+					teamname = str(col).strip()
+				if len(str(col).strip())>0 and len(teamname)>0:
+					AddTeamName(slcon,teamname,str(col).strip())
+				colnumber = colnumber + 1
+	else:
+		print "Can't find data to load " + str(filename)
+		
+def LoadExpressionData(slcon, filename):
+	print "Loading CSV (Expression) data"
+	if os.path.isfile(os.path.abspath(os.path.expanduser(filename))) != False:
+		reader = csv.DictReader(open(os.path.abspath(os.path.expanduser(filename)), 'rU'))
+		for row in reader:
+			expression = ''
+			win = None
+			confident = None
+			for name in row.keys():
+				if name.lower() == 'regex' or name.lower() == 'expression':
+					expression = str(row.get(name,'')).strip()
+				elif name.lower() == 'win' or name.lower() == 'home win':
+					win = isInt(str(row.get(name,'')))
+				elif name.lower() == 'confident' or name.lower() == 'sure' or name.lower() == 'strong':
+					confident = isInt(str(row.get(name,'')))
+				
+			if len(expression)>0 and win != None and confident !=None:
+				AddExpRow(slcon, expression, win, confident)
+			
+	else:
+		print "Can't find data to load " + str(filename)
+		
+
+def LoadSportsData(slcon, filename):
+	print "Loading CSV (Word) data"
+	if os.path.isfile(os.path.abspath(os.path.expanduser(filename))) != False:
+		reader = csv.DictReader(open(os.path.abspath(os.path.expanduser(filename)), 'rU'))
+		for row in reader:
+			word = ''
+			for name in row.keys():
+				if name.lower() == 'word' or name.lower() == 'expression' or name.lower() == 'phrase':
+					word = str(row.get(name,'')).strip()
+			if len(word)>0:
+				AddSportsRow(slcon, word)
+	else:
+		print "Can't find data to load " + str(filename)
+		
+def LoadExpertData(slcon, filename):
+	print "Loading CSV (Expert) data"
+	if os.path.isfile(os.path.abspath(os.path.expanduser(filename))) != False:
+		reader = csv.DictReader(open(os.path.abspath(os.path.expanduser(filename)), 'rU'))
+		for row in reader:
+			word = ''
+			for name in row.keys():
+				if name.lower() == 'word' or name.lower() == 'expression' or name.lower() == 'phrase':
+					word = str(row.get(name,'')).strip()
+			if len(word)>0:
+				AddExpertRow(slcon, word)
+	else:
+		print "Can't find data to load " + str(filename)
+
+
+def MoveTweets(tabledb,resultdb):
+	global newFormat
+	c = tabledb.cursor()
+	ic = resultdb.cursor()
+	if newFormat:
+		c.execute("SELECT userid, created_at, `text`, retweet, retweet_count, twitterid, place, inconversation, followers FROM tweet")
+	else:
+		c.execute("SELECT userid, created_at, `text`, retweet, retweet_count, twitterid, place, inconversation, 0 AS followers FROM tweet")
+	for row in c:
+		mylist = [row[0],row[1],row[2],row[3],row[4],row[5],row[6],row[7],row[8]]
+		ic.execute("INSERT INTO tweet(userid, created_at, `text`, retweet, retweet_count, twitterid, place, inconversation,followers) VALUES(?,?,?,?,?,?,?,?,?)", mylist)
+		resultdb.commit()
+	c.close()
+	ic.close()
+
+
+def CreateCleanUserSource(worddb,tabledb,resultdb):
+	expertList = []
+	wordList = []
+	c = worddb.cursor()
+	c.execute("SELECT word FROM sports")
+	for row in c:
+		word = str(row[0]).strip()
+		if len(word)>0:
+			wordList.append(word)
+	c.execute("SELECT word FROM expert")
+	for row in c:
+		word = str(row[0]).strip()
+		if len(word)>0:
+			expertList.append(word)
+	c.close()
+	c = tabledb.cursor()
+	c.execute("SELECT description, twitterid FROM users")
+	print "Moving Users"
+	for row in c:
+		foundexpert = False
+		foundsports = False
+		description = row[0]
+		twitterid = isInt(row[1])
+		if (twitterid != None and twitterid != False) and len(description)>0:
+			for word in wordList:
+				pstring = u"\\b" + re.escape(unicode(word)) + u"\\b"
+				pattern = re.compile(pstring,re.U|re.I)
+				findcategory = pattern.search(description)
+				if findcategory != None:
+					foundsports = True
+					break
+			for word in expertList:
+				pstring = u"\\b" + re.escape(unicode(word)) + u"\\b"
+				pattern = re.compile(pstring,re.U|re.I)
+				findcategory = pattern.search(description)
+				if findcategory != None:
+					foundexpert = True
+					break
+		if (twitterid != None and twitterid != False):
+			if foundexpert == True:
+				expert = 1
+			else:
+				expert = 0
+			if foundsports == True:
+				sports = 1
+			else:
+				sports = 0
+			MoverUserRow(tabledb,resultdb,twitterid,sports, expert)
+	print "Moving Tweets"
+	MoveTweets(tabledb,resultdb)
+	c.close()
+	
+
+def CouldMatchFunc(searchstring,expression,twoteam):	
+	if twoteam == True:
+		testexpression = expression.replace("TEAM1",r"[\w\d']{3,}([\s]+[\w\d']{3,})?").replace("TEAM2",r"[\w\d']{3,}([\s]+[\w\d']{3,})?")
+	else:
+		testexpression = expression.replace("TEAM1",r"[\w\d']{3,}([\s]+[\w\d']{3,})?")
+	testpattern = re.compile(testexpression,re.U|re.I)
+	testfound = testpattern.search(searchstring)
+	if testfound != None:
+		return True
+	else:
+		return False
+
+
+def intersect(a, b):
+     return list(set(a) & set(b))
+
+def intersectNS(a, b):
+     return list(a & b)		
+
+def LoopOverTeamCombinations(searchstring,expression,teamlistone, teamlisttwo):
+		
+	for teamone in teamlistone:
+		if len(teamlisttwo)>0:
+			for teamtwo in teamlisttwo:
+				teamone = re.escape(teamone)
+				teamtwo = re.escape(teamtwo)
+				finalexpression = expression.replace("TEAM1",teamone).replace("TEAM2",teamtwo)
+				pattern = re.compile(finalexpression,re.U|re.I)
+				found = pattern.search(searchstring)
+				if found != None:
+					# print "Match found: " + str(finalexpression)
+					return True
+		else:
+			teamone = re.escape(teamone)
+			finalexpression = expression.replace("TEAM1",teamone)
+			pattern = re.compile(finalexpression,re.U|re.I)
+			found = pattern.search(searchstring)
+			if found != None:
+				# print "Match found: " + str(finalexpression)
+				return True
+	return False
+
+
+def TeamTwoInString(searchstring):
+	pattern = re.compile(u"team2",re.U|re.I)
+	found = pattern.search(searchstring)
+	if found != None:
+		return False
+	else:
+		return True
+		
+
+def LoopOverTeams(teams):
+	teamslist = []
+	c = teams.cursor()
+	c.execute("SELECT DISTINCT team_key FROM team")
+	for row in c:
+		item = {}
+		item['key'] = row[0]
+		item['names'] = GetNickNames(teams,item['key'])
+		teamslist.append(item)
+	c.close()
+	return teamslist
+	
+def GetAllNames(teams):
+	teamslist = []
+	c = teams.cursor()
+	c.execute("SELECT DISTINCT name FROM team")
+	for row in c:
+		item = row[0]
+		teamslist.append(item)
+	c.close()
+	return teamslist
+
+def GetNickNames(teams,key):
+	names = []
+	c = teams.cursor()
+	c.execute("SELECT DISTINCT name FROM team WHERE team_key=?",[key,])
+	for row in c:
+		names.append(row[0])
+	c.close()
+	return set(names)
+
+
+def GetExpressions(con):
+	expressionsList = []
+	c = con.cursor()
+	c.execute("SELECT DISTINCT rule, win, strong FROM expression")
+	for row in c:
+		rule = {}
+		rule['rule'] = row[0]
+		rule['teamtwo'] = TeamTwoInString(rule['rule'])
+		rule['win'] = row[1]
+		rule['strong'] = row[2]
+		expressionsList.append(rule)
+	c.close()
+	return expressionsList
+	
+def FindGame(tabledb, resultdate, teamone, teamtwo=""):
+	c = tabledb.cursor()
+	home_win = None
+	when = None
+	game_id = None
+	if len(teamtwo)>0:
+		mylist = [teamone, teamtwo, resultdate]
+		c.execute("SELECT home_win, `when`, game_id FROM games WHERE home_team=? AND away_team=? AND `when`>? ORDER BY `when` ASC LIMIT 1",mylist)
+	else:
+		mylist = [teamone, resultdate]
+		c.execute("SELECT home_win, `when`, game_id FROM games WHERE home_team=? AND `when`>? ORDER BY `when` ASC LIMIT 1",mylist)
+	for row in c:
+		home_win = row[0]
+		when = row[1]
+		game_id = row[2]
+	c.close()
+	return (home_win,when,game_id)
+
+def MoverUserRow(tabledb,resultdb,twitterid, sports=1, expert=1):
+	c = tabledb.cursor()
+	ic = resultdb.cursor()
+	c.execute("SELECT twitterid, twitterhandle, name, location, verified, following, followers, description, created_at, status_count, listed_count, favorites_count FROM users WHERE twitterid=?",[twitterid,])
+	for row in c:
+		mylist = [row[0], row[1], row[2], row[3], row[4], row[5], row[6], row[7], row[8], row[9], row[10], row[11], sports, expert]
+		ic.execute("INSERT INTO users(twitterid, twitterhandle, name, location, verified, following, followers, description, created_at, status_count, listed_count, favorites_count, sports, expert) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,?,?)",mylist)
+		resultdb.commit()
+	c.close()
+	ic.close()	
+	
+	
+#	print "Moved twitterid: " + str(twitterid) 
+				
+def getDate(mstr,tz=""):
+	try:
+		if len(tz)>0:
+			mdate = localize(parse(mstr.strip()))
+		else:
+			mdate = parse(mstr.strip())
+		return mdate
+	except Exception as inst:
+		return None
+
+def CheckAllNames(tweet,allnames):
+	nameslist = []
+	for word in allnames:
+		pstring = u"\\b[#@]?" + re.escape(word.strip()) + u"\\b"
+		spattern = re.compile(pstring,re.U|re.I)
+		testfind = spattern.search(tweet)
+		if testfind != None:
+			nameslist.append(word)
+	return set(nameslist)
+	
+
+def FindMaxPredition(cleandb):
+	c = cleandb.cursor()
+	id = 0
+	c.execute("SELECT twitterid FROM found_prediction ORDER BY twitterid DESC LIMIT 1")
+	for row in c:
+		id = row[0]
+	c.close()
+	return id
+
+def FindPredictions(cleandb,slconn):
+	c = cleandb.cursor()
+	teamsone = LoopOverTeams(slconn)
+	teamstwo = LoopOverTeams(slconn)
+	expr = GetExpressions(slconn)
+	allnames = GetAllNames(slconn)
+	predictions = 0
+	overid = FindMaxPredition(cleandb)
+	c.execute("SELECT tweet.created_at AS ca, tweet.text AS t, tweet.twitterid AS tid FROM tweet WHERE twitterid > ? ORDER BY twitterid ASC",[overid,])
+	for row in c:
+		c_date = row[0]
+		tweet = row[1]
+		id = row[2]
+		getnamelist = CheckAllNames(tweet,allnames)
+		for exps in expr:
+			rule = exps['rule']
+			win = exps['win']
+			strong = exps['strong']
+			cmfunc = CouldMatchFunc(tweet,rule,exps['teamtwo'])
+			if cmfunc == False:
+				continue
+			if exps['teamtwo'] == True:
+				game_win = None
+				when = None
+				game_id = None
+				done = False
+				for item in teamsone:
+					tone_key = item['key']
+					for itemtwo in teamstwo:
+						ttwo_key = itemtwo['key']
+						if tone_key != ttwo_key:
+							couldmatch = LoopOverTeamCombinations(tweet,rule,intersectNS(item['names'], getnamelist), intersectNS(itemtwo['names'], getnamelist))
+							if couldmatch == True:
+								(game_win, when, game_id) = FindGame(slconn, c_date, tone_key, ttwo_key)
+								if game_win != None:
+									done = True
+									break
+					if done == True:
+						break
+						
+				if game_win != None and game_id != None and when !=None and len(tone_key)>0:
+					RecordPredition(cleandb, id, game_win, win, when, strong, game_id)
+					predictions = predictions + 1
+					if (predictions % 100) == 0:
+						print "Found:" + str(predictions) + " predictions"
+						# sys.exit()
+			else:
+				game_win = None
+				when = None
+				game_id = None
+				for item in teamsone:
+					tone_key = item['key']
+					couldmatch = LoopOverTeamCombinations(tweet,rule,intersectNS(item['names'], getnamelist), [])
+					if couldmatch == True:
+						(game_win, when, game_id) = FindGame(slconn, c_date, tone_key)
+						if game_win != None:
+							break
+				if game_win != None and game_id != None and when !=None and len(tone_key)>0:
+					RecordPredition(cleandb, id, game_win, win, when, strong, game_id)
+					predictions = predictions + 1
+					if (predictions % 100) == 0:
+						print "Found:" + str(predictions) + " predictions"
+						# sys.exit()
+	c.close()
+
+def RecordPredition(cleandb, id, game_win, win, when, strong, game_id):
+	if game_win == win:
+		correct = 1
+	else:
+		correct = 0	
+	c = cleandb.cursor()
+	mylist = [id,correct,strong,when, game_id]
+	c.execute("INSERT INTO found_prediction(twitterid, correct, strong, gametime, game_id) VALUES(?,?,?,?,?)",mylist)
+#	print "Prediction recorded"
+	cleandb.commit()
+	c.close()
+
+def ExportPredictins(cleandb, filename):
+	if os.path.abspath(os.path.expanduser(filename)) != False:
+		with open(os.path.abspath(os.path.expanduser(filename)), "wb") as f:
+			fileWriter = csv.writer(f, delimiter=',',quoting=csv.QUOTE_MINIMAL)
+			c = cleandb.cursor()
+			print "Exporting CSV (Prediction)"
+			header = ['twitterid', 'correct', 'strong', 'gametime', 'verified', 'following', 'followers', 'user_created_at', 'status_count', 'listed_count', 'favorites_count', 'expert', 'sports', 'tweet_created_at','retweet_count','is_retweet', 'inconversation','before_game_time', 'account_age','tweet_flow','common_belief','belief_count','game_id','t_followers']
+			fileWriter.writerow(header)
+			c.execute("SELECT prediction.twitterid AS twitterid, prediction.correct AS correct, prediction.strong AS strong, prediction.gametime AS gametime, users.verified AS verified, users.following AS following, users.followers AS followers, users.created_at AS user_created_at, users.status_count AS status_count, users.listed_count AS listed_count, users.favorites_count AS favorites_count, users.expert AS expert, users.sports AS sports, tweet.created_at AS created_at, tweet.retweet_count AS retweet, tweet.retweet AS is_retweet, tweet.inconversation AS inconversation, (julianday(prediction.gametime) - julianday(tweet.created_at)) AS before_game_time, ((julianday(tweet.created_at) - julianday(users.created_at))/365.25) AS account_age, (users.status_count/((julianday(tweet.created_at) - julianday(users.created_at))/365.25)) AS tweet_flow, beliefs.cb AS common_belief, beliefs.c AS belief_count, prediction.game_id AS game_id, tweet.followers AS t_followers FROM found_prediction AS prediction JOIN tweet ON prediction.twitterid=tweet.twitterid JOIN users ON tweet.userid=users.twitterid JOIN (SELECT AVG(p.correct) AS cb, COUNT(*) AS c, p.game_id AS game_id FROM found_prediction AS p JOIN tweet ON p.twitterid=tweet.twitterid WHERE tweet.retweet=0 GROUP BY p.game_id) AS beliefs ON (beliefs.game_id=prediction.game_id) WHERE tweet.retweet=0 AND ((julianday(tweet.created_at) - julianday(users.created_at))/365.25) > 0.25")
+			for row in c:
+				fileWriter.writerow(row)
+			c.close()
+	else:
+		print "Could not write to that location " + str(os.path.abspath(os.path.expanduser(filename)))
+
+def ExportUserPredictions(cleandb, filename):
+	if os.path.abspath(os.path.expanduser(filename)) != False:
+		with open(os.path.abspath(os.path.expanduser(filename)), "wb") as f:
+			fileWriter = csv.writer(f, delimiter=',',quoting=csv.QUOTE_MINIMAL)
+			c = cleandb.cursor()
+			print "Exporting CSV (User)"
+			header = ['prediction_count','accuracy', 'confident', 'very_confident','some_confidence', 'verified', 'following', 'followers', 'user_created_at', 'status_count', 'listed_count', 'favorites_count', 'expert', 'sports', 'account_age','tweet_flow']
+			fileWriter.writerow(header)
+			c.execute("SELECT COUNT(*) AS c, AVG(acc) AS accuracy, AVG(s_con) AS confident, AVG(v_con) AS very_confident, AVG(sum_con) AS some_confidence, MAX(verified) AS verified, MAX(following) AS following, MAX(followers) AS followers, MAX(user_created_at) AS user_created_at, MAX(status_count) AS status_count, MAX(listed_count) AS listed_count, MAX(favorites_count) AS favorites_count, MAX(expert) AS expert, MAX(sports) AS sports, MAX(account_age) AS account_age, MAX(tweet_flow) AS tweet_flow FROM (SELECT users.twitterid AS userid, prediction.correct AS acc, CASE WHEN prediction.strong >0 THEN 1 ELSE 0 END AS s_con, CASE WHEN prediction.strong >1 THEN 1 ELSE 0 END AS v_con, CASE WHEN prediction.strong=1 THEN 1 ELSE 0 END AS sum_con, users.verified AS verified, users.following AS following, users.followers AS followers, users.created_at AS user_created_at, users.status_count AS status_count, users.listed_count AS listed_count, users.favorites_count AS favorites_count, users.expert AS expert, users.sports AS sports, ((julianday(tweet.created_at) - julianday(users.created_at))/365.25) AS account_age, (users.status_count/((julianday(tweet.created_at) - julianday(users.created_at))/365.25)) AS tweet_flow FROM users JOIN tweet ON users.twitterid=tweet.userid JOIN found_prediction AS prediction ON prediction.twitterid=tweet.twitterid WHERE tweet.retweet=0 AND tweet.inconversation=0) AS mytable WHERE account_age>0.25 GROUP BY userid")
+			for row in c:
+				fileWriter.writerow(row)
+			c.close()
+			
+
+def PrintStatus(db):
+	print "Tweet Count: "
+	PrintCountTweets(db)
+	print "User Count: "
+	PrintCountUser(db)
+	print "Prediction Count: "
+	PrintCountPrediction(db)
+
+def main():
+	slconn = sqlite3.connect(':memory:')
+	desc = 'Analyze Twitter Data'
+	p = optparse.OptionParser(description=desc)
+	
+	CreateTables(slconn)
+	
+	tweetsdb = False
+	savefile = False
+	cleandb = False
+	wordlist = False
+	expetlist = False
+	
+	p.add_option('--regex', dest="regex", help="Load Regex data", default='', metavar='"<File Path>"')
+	p.add_option('--team', dest="team", help="Load Team data", default='', metavar='"<File Path>"')
+	p.add_option('--game', dest="game", help="Load Game data", default='', metavar='"<File Path>"')
+	p.add_option('--word', dest="word", help="Load Word data", default='', metavar='"<File Path>"')
+	p.add_option('--expert', dest="expert", help="Load Expert data", default='', metavar='"<File Path>"')
+	p.add_option('--tweets', dest="tweets", help="Set Twitter Database", default='', metavar='"<File Path>"')
+	p.add_option('--clean', dest="save", help="Set Clean Twitter Database", default='', metavar='"<File Path>"')
+	p.add_option('--export', dest="export", help="Set CSV Export File", default='', metavar='"<File Path>"')
+	p.add_option('--uexport', dest="uexport", help="Set CSV Export File For User Data", default='', metavar='"<File Path>"')
+	p.add_option("--import", action="store_true", dest="importTrue", default=False, help="Import data from dirty data to clean data")
+	p.add_option("--find", action="store_true", dest="find", default=False, help="Find Predictions")
+	p.add_option("--status", action="store_true", dest="status", default=False, help="Show Status")
+	p.add_option("--reset", action="store_true", dest="reset", default=False, help="Reset Predictions")
+	p.add_option("--oldFormat", action="store_false", dest="new_format", default=True, help="Use Old Data Format")
+	
+
+	(options, arguments) = p.parse_args()
+	global newFormat
+	if options.new_format == False:
+		newFormat = False
+
+	if len(options.tweets.strip())>0:
+		if os.path.isfile(os.path.abspath(os.path.expanduser(options.tweets.strip()))) != False:
+			tweetsdb = sqlite3.connect(os.path.abspath(os.path.expanduser(options.tweets.strip())))
+			
+	if len(options.save.strip())>0:
+		if isReturnFile(options.save.strip()) != False:
+			cleandb = sqlite3.connect(isReturnFile(options.save.strip()))
+			CreateCleanTables(cleandb)
+	
+	if len(options.export.strip())>0:
+		if os.path.isfile(os.path.abspath(os.path.expanduser(options.export.strip()))) != False:
+			savefile = os.path.abspath(os.path.expanduser(options.export.strip()))
+	
+	expressionsloaded = False				
+	if len(options.regex.strip())>0:
+		if os.path.isfile(os.path.abspath(os.path.expanduser(options.regex.strip()))) != False:
+			LoadExpressionData(slconn,options.regex.strip())
+			expressionsloaded = True
+			
+	if len(options.team.strip())>0:
+		if os.path.isfile(os.path.abspath(os.path.expanduser(options.team.strip()))) != False:
+			LoadTeamData(slconn,options.team.strip())
+	
+	gamesloaded = False		
+	if len(options.game.strip())>0:
+		if os.path.isfile(os.path.abspath(os.path.expanduser(options.game.strip()))) != False:
+			LoadGameData(slconn,options.game.strip())
+			gamesloaded = True
+	
+	if len(options.word.strip())>0:
+		if os.path.isfile(os.path.abspath(os.path.expanduser(options.word.strip()))) != False:
+			LoadSportsData(slconn,options.word.strip())
+			wordlist = True
+
+	if len(options.expert.strip())>0:
+		if os.path.isfile(os.path.abspath(os.path.expanduser(options.expert.strip()))) != False:
+			LoadExpertData(slconn,options.expert.strip())
+			expertlist = True
+			
+	if cleandb != False and tweetsdb != False and wordlist == True and options.importTrue == True:
+		CreateCleanUserSource(slconn,tweetsdb,cleandb)
+	
+	
+	if cleandb != False and options.reset == True:
+		ResetCleanTables(cleandb)
+	
+	if cleandb != False and expressionsloaded == True and gamesloaded == True and options.find == True:
+		FindPredictions(cleandb,slconn)
+	elif options.importTrue == True:
+		print "You must have expressions, games and the clean database loaded to run predictions"
+		
+	if options.status == True and cleandb != False:
+		PrintStatus(cleandb)
+		
+	if len(options.export.strip())>0:
+		ExportPredictins(cleandb, options.export.strip())
+		
+	if len(options.uexport.strip())>0:
+		ExportUserPredictions(cleandb, options.uexport.strip())
+			
+if __name__ == '__main__':
+	main()
