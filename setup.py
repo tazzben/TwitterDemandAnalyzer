@@ -9,7 +9,7 @@ long_desc = """
 
 
 setup(name="TwitterDemandAnalyzer",
-      version=1.0,
+      version=1.1,
       description="A analysis tool (to be used on the data created by the collector) for economists using the fact that twitter presents a demand curve for information",
       author="Ben Smith",
       author_email="tazz_ben@ad.wsu.edu",

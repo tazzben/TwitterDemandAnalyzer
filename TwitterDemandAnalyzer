@@ -51,7 +51,7 @@ def isInt(num):
 
 def CreateTables(conn):
 	c = conn.cursor()
-	c.execute("CREATE TABLE if not exists expression(rule TEXT, win INTEGER, strong INTEGER)")
+	c.execute("CREATE TABLE if not exists expression(rule TEXT, win INTEGER default 0, strong INTEGER default 0)")
 	c.execute("CREATE TABLE if not exists games(home_team TEXT, away_team TEXT, `when` DATETIME, home_win INTEGER, game_id INTEGER)")
 	c.execute("CREATE TABLE if not exists team(team_key TEXT, name TEXT)")
 	c.execute("CREATE TABLE if not exists sports(word TEXT)")
@@ -72,6 +72,14 @@ def CreateCleanTables(conn):
 	c.execute("CREATE INDEX if not exists gameid_prediction ON found_prediction(game_id)")
 	conn.commit()
 	c.close()
+
+def CreatePreTable(conn, table):
+	c = conn.cursor()
+	table = scrub(table)
+	c.execute("CREATE TABLE if not exists  " + table + "(twitterid INTEGER, score INTEGER)")
+	conn.commit()
+	c.close()
+
 
 def ResetCleanTables(conn):
 	c = conn.cursor()
@@ -98,9 +106,12 @@ def PrintCountUser(conn):
 		print str(row[0])
 	c.close()
 
-def PrintCountPrediction(conn):
+def PrintCountPrediction(conn,table):
 	c = conn.cursor()
-	c.execute("SELECT COUNT(*) AS c FROM prediction")
+	if len(scrub(table))>0:
+		c.execute("SELECT COUNT(*) AS c FROM " + scrub(table))	
+	else:
+		c.execute("SELECT COUNT(*) AS c FROM prediction")
 	for row in c:
 		print str(row[0])
 	c.close()
@@ -200,17 +211,19 @@ def LoadExpressionData(slcon, filename):
 		reader = csv.DictReader(open(os.path.abspath(os.path.expanduser(filename)), 'rU'))
 		for row in reader:
 			expression = ''
-			win = None
+			win = 0
 			confident = None
 			for name in row.keys():
 				if name.lower() == 'regex' or name.lower() == 'expression':
 					expression = str(row.get(name,'')).strip()
 				elif name.lower() == 'win' or name.lower() == 'home win':
 					win = isInt(str(row.get(name,'')))
-				elif name.lower() == 'confident' or name.lower() == 'sure' or name.lower() == 'strong':
+				elif name.lower() == 'confident' or name.lower() == 'sure' or name.lower() == 'strong' or name.lower() == 'score':
 					confident = isInt(str(row.get(name,'')))
 				
-			if len(expression)>0 and win != None and confident !=None:
+			if len(expression)>0 and confident !=None:
+				if win==None:
+					win=0
 				AddExpRow(slcon, expression, win, confident)
 			
 	else:
@@ -334,6 +347,16 @@ def intersect(a, b):
 def intersectNS(a, b):
      return list(a & b)		
 
+
+def LoopOverCombinations(searchstring,expression):
+	finalexpression = expression
+	pattern = re.compile(finalexpression,re.U|re.I)
+	found = pattern.search(searchstring)
+	if found != None:
+		return True
+	return False
+
+
 def LoopOverTeamCombinations(searchstring,expression,teamlistone, teamlisttwo):
 		
 	for teamone in teamlistone:
@@ -399,19 +422,22 @@ def GetNickNames(teams,key):
 	return set(names)
 
 
-def GetExpressions(con):
+def GetExpressions(con,games=True):
 	expressionsList = []
 	c = con.cursor()
 	c.execute("SELECT DISTINCT rule, win, strong FROM expression")
 	for row in c:
 		rule = {}
 		rule['rule'] = row[0]
-		rule['teamtwo'] = TeamTwoInString(rule['rule'])
-		rule['win'] = row[1]
+		if games == True:
+			rule['teamtwo'] = TeamTwoInString(rule['rule'])
+			rule['win'] = row[1]
 		rule['strong'] = row[2]
 		expressionsList.append(rule)
 	c.close()
 	return expressionsList
+
+
 	
 def FindGame(tabledb, resultdate, teamone, teamtwo=""):
 	c = tabledb.cursor()
@@ -466,14 +492,51 @@ def CheckAllNames(tweet,allnames):
 	return set(nameslist)
 	
 
-def FindMaxPredition(cleandb):
+def scrub(table_name):
+	return ''.join( chr for chr in table_name if chr.isalnum() )
+
+def FindMaxPredition(cleandb, newtable=''):
+	newtable = scrub(newtable)
 	c = cleandb.cursor()
 	id = 0
-	c.execute("SELECT twitterid FROM found_prediction ORDER BY twitterid DESC LIMIT 1")
+	if len(newtable)>0:
+		c.execute("SELECT twitterid FROM " + newtable + " ORDER BY twitterid DESC LIMIT 1")
+	else:
+		c.execute("SELECT twitterid FROM found_prediction ORDER BY twitterid DESC LIMIT 1")
 	for row in c:
 		id = row[0]
 	c.close()
 	return id
+
+
+
+
+def GenPrediction(cleandb,slconn,newtable,des=False):
+	newtable = scrub(newtable)
+	c = cleandb.cursor()
+	overid = FindMaxPredition(cleandb,newtable)
+	expr = GetExpressions(slconn,False)
+	predictions = 0
+	if des == True:
+		c.execute("SELECT tweet.created_at AS ca, users.description AS t, tweet.twitterid AS tid FROM tweet JOIN users ON tweet.userid=users.twitterid WHERE tweet.twitterid > ? ORDER BY tweet.twitterid ASC",[overid,])	
+	else:
+		c.execute("SELECT tweet.created_at AS ca, tweet.text AS t, tweet.twitterid AS tid FROM tweet WHERE twitterid > ? ORDER BY twitterid ASC",[overid,])
+	predictions = 0
+	for row in c:
+		c_date = row[0]
+		tweet = row[1]
+		id = row[2]
+		for exps in expr:
+			rule = exps['rule']
+			strong = exps['strong']
+			couldmatch = LoopOverCombinations(tweet,rule)
+			if couldmatch == True:
+				RecordGenPredition(cleandb, id, strong, newtable)
+				predictions = predictions + 1
+				if (predictions % 100) == 0:
+					print "Found:" + str(predictions) + " predictions"
+					# sys.exit()
+	c.close()
 
 def FindPredictions(cleandb,slconn):
 	c = cleandb.cursor()
@@ -540,6 +603,17 @@ def FindPredictions(cleandb,slconn):
 						# sys.exit()
 	c.close()
 
+
+def RecordGenPredition(cleandb, id, strong, newtable):
+	c = cleandb.cursor()
+	mylist = [id,strong]
+	newtable = scrub(newtable)
+	sql = "INSERT INTO " + newtable + "(twitterid, score) VALUES(?,?)"
+	c.execute(sql,mylist)
+#	print "Prediction recorded"
+	cleandb.commit()
+	c.close()
+
 def RecordPredition(cleandb, id, game_win, win, when, strong, game_id):
 	if game_win == win:
 		correct = 1
@@ -567,6 +641,21 @@ def ExportPredictins(cleandb, filename):
 	else:
 		print "Could not write to that location " + str(os.path.abspath(os.path.expanduser(filename)))
 
+def ExportGenPredictins(cleandb, filename,table):
+	if os.path.abspath(os.path.expanduser(filename)) != False:
+		with open(os.path.abspath(os.path.expanduser(filename)), "wb") as f:
+			fileWriter = csv.writer(f, delimiter=',',quoting=csv.QUOTE_MINIMAL)
+			c = cleandb.cursor()
+			print "Exporting CSV "
+			header = ['twitterid', 'score', 'verified', 'following', 'followers', 'user_created_at', 'status_count', 'listed_count', 'favorites_count', 'tweet_created_at','retweet_count','is_retweet', 'inconversation', 'account_age','tweet_flow','t_followers']
+			fileWriter.writerow(header)
+			c.execute("SELECT prediction.twitterid AS twitterid, prediction.score AS score, users.verified AS verified, users.following AS following, users.followers AS followers, users.created_at AS user_created_at, users.status_count AS status_count, users.listed_count AS listed_count, users.favorites_count AS favorites_count, tweet.created_at AS created_at, tweet.retweet_count AS retweet, tweet.retweet AS is_retweet, tweet.inconversation AS inconversation, ((julianday(tweet.created_at) - julianday(users.created_at))/365.25) AS account_age, (users.status_count/((julianday(tweet.created_at) - julianday(users.created_at))/365.25)) AS tweet_flow, tweet.followers AS t_followers FROM "+ table +" AS prediction JOIN tweet ON prediction.twitterid=tweet.twitterid JOIN users ON tweet.userid=users.twitterid ")
+			for row in c:
+				fileWriter.writerow(row)
+			c.close()
+	else:
+		print "Could not write to that location " + str(os.path.abspath(os.path.expanduser(filename)))
+
 def ExportUserPredictions(cleandb, filename):
 	if os.path.abspath(os.path.expanduser(filename)) != False:
 		with open(os.path.abspath(os.path.expanduser(filename)), "wb") as f:
@@ -581,13 +670,13 @@ def ExportUserPredictions(cleandb, filename):
 			c.close()
 			
 
-def PrintStatus(db):
+def PrintStatus(db,table):
 	print "Tweet Count: "
 	PrintCountTweets(db)
 	print "User Count: "
 	PrintCountUser(db)
 	print "Prediction Count: "
-	PrintCountPrediction(db)
+	PrintCountPrediction(db,table)
 
 def main():
 	slconn = sqlite3.connect(':memory:')
@@ -612,13 +701,16 @@ def main():
 	p.add_option('--export', dest="export", help="Set CSV Export File", default='', metavar='"<File Path>"')
 	p.add_option('--uexport', dest="uexport", help="Set CSV Export File For User Data", default='', metavar='"<File Path>"')
 	p.add_option("--import", action="store_true", dest="importTrue", default=False, help="Import data from dirty data to clean data")
-	p.add_option("--find", action="store_true", dest="find", default=False, help="Find Predictions")
+	p.add_option("--find", action="store_true", dest="find", default=False, help="Find Matches")
+	p.add_option("--processedtable", dest="predictiontable", default='', help="Set Processed Table",metavar='table_name')
+	p.add_option("--des", action="store_true", dest="des", default=False, help="Run user descriptions instead of tweets")
 	p.add_option("--status", action="store_true", dest="status", default=False, help="Show Status")
 	p.add_option("--reset", action="store_true", dest="reset", default=False, help="Reset Predictions")
 	p.add_option("--oldFormat", action="store_false", dest="new_format", default=True, help="Use Old Data Format")
 	
 
 	(options, arguments) = p.parse_args()
+	newPreTable = False
 	global newFormat
 	if options.new_format == False:
 		newFormat = False
@@ -631,6 +723,11 @@ def main():
 		if isReturnFile(options.save.strip()) != False:
 			cleandb = sqlite3.connect(isReturnFile(options.save.strip()))
 			CreateCleanTables(cleandb)
+	
+	if len(scrub(options.predictiontable.strip()))>0 and cleandb != False:
+		predictionTable = "prediction" + scrub(scrub(options.predictiontable.strip()))
+		CreatePreTable(cleandb, predictionTable)
+		newPreTable = True
 	
 	if len(options.export.strip())>0:
 		if os.path.isfile(os.path.abspath(os.path.expanduser(options.export.strip()))) != False:
@@ -662,23 +759,28 @@ def main():
 			LoadExpertData(slconn,options.expert.strip())
 			expertlist = True
 			
-	if cleandb != False and tweetsdb != False and wordlist == True and options.importTrue == True:
+	if cleandb != False and tweetsdb != False and options.importTrue == True:
 		CreateCleanUserSource(slconn,tweetsdb,cleandb)
 	
 	
 	if cleandb != False and options.reset == True:
 		ResetCleanTables(cleandb)
 	
-	if cleandb != False and expressionsloaded == True and gamesloaded == True and options.find == True:
+	if cleandb != False and expressionsloaded == True and gamesloaded == True and options.find == True and newPreTable == False:
 		FindPredictions(cleandb,slconn)
-	elif options.importTrue == True:
-		print "You must have expressions, games and the clean database loaded to run predictions"
+	elif cleandb != False and expressionsloaded == True and options.find == True and newPreTable == True:
+		GenPrediction(cleandb,slconn,predictionTable,options.des)
+	elif options.find == True:
+		print "You must have expressions, the clean database, and either a prediction table or games set to run predictions"
 		
 	if options.status == True and cleandb != False:
-		PrintStatus(cleandb)
+		PrintStatus(cleandb,predictionTable)
 		
 	if len(options.export.strip())>0:
-		ExportPredictins(cleandb, options.export.strip())
+		if newPreTable == True:
+			ExportGenPredictins(cleandb, options.export.strip(),predictionTable)
+		else:
+			ExportPredictins(cleandb, options.export.strip())
 		
 	if len(options.uexport.strip())>0:
 		ExportUserPredictions(cleandb, options.uexport.strip())
